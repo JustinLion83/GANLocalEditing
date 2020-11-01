@@ -283,36 +283,44 @@ class Truncation(nn.Module):
     def forward(self, x):
         assert x.dim() == 3
         return torch.lerp(self.avg_latent, x, self.psi)
-
-
+    
+"""使用風格縮放係數就是在這裡!"""
+#######################################################
 class LayerEpilogue(nn.Module):
     """Things to do at the end of each layer."""
-
     def __init__(self, channels, use_noise, use_instance_norm, use_styles,
                  activation_layer):
         super().__init__()
         layers = []
+        
         if use_noise:
-            layers.append(('noise', NoiseLayer(channels)))
+            layers.append(('noise', NoiseLayer(channels)))   
         layers.append(('activation', activation_layer))
+        
         if use_instance_norm:
             layers.append(('instance_norm', nn.InstanceNorm2d(channels)))
+            
         self.top_epi = nn.Sequential(OrderedDict(layers))
         self.use_styles = use_styles
-
-
+        
     def forward(self, x, styles_in_slice=None):
+        """styles_in_slice is array with shape: [N, 2, channels, 1, 1]"""
+        
+        """self.top_epi: Including [`noise`, `activation`, `instance_norm`]"""
         x = self.top_epi(x)
-
+        
+        """Appling `style scaling` to feature-maps"""
         if self.use_styles:
             x = x * (styles_in_slice[:, 0] + 1.) + styles_in_slice[:, 1] #apply style
         else:
             assert styles_in_slice is None
         return x
+#######################################################
 
-
-
+"""Elements of G_synthesis"""
+##################################################################
 class InputBlock(nn.Module):
+    """Input in forward() is a list of `2 array`"""
     def __init__(self, nf,  gain, use_wscale, use_noise,
                  use_instance_norm, use_styles, activation_layer):
         super().__init__()
@@ -328,10 +336,14 @@ class InputBlock(nn.Module):
                                   use_styles, activation_layer)
 
     def forward(self, styles_in_range):
-        batch_size = styles_in_range[0].size(0)
-
-        x = self.const.expand(batch_size, -1, -1, -1)
-        x = x + self.bias.view(1, -1, 1, 1)
+        """
+        styles_in_range shape is `a list` with `2 array`, i.e. [ary1, ary2]
+        shape of each array   is [N, 2, channels, 1, 1]
+        """
+        # 相當於tf.tile(): 沿某個軸重複?次
+        batch_size = styles_in_range[0].size(0)       # Get N
+        x = self.const.expand(batch_size, -1, -1, -1) # Broadcast to size N
+        x = x + self.bias.view(1, -1, 1, 1)           # Apply bias
 
         x = self.epi1(x, styles_in_range[0])
 
@@ -362,15 +374,17 @@ class GSynthesisBlock(nn.Module):
         x = self.conv1(x)
         x = self.epi2(x, styles_in_range[1])
         return x
+##################################################################
 
+"""w_to_ys()會呼叫這裡!"""
 class G_style(nn.Module):
     def __init__(self,
                  dlatent_size=512,  # Disentangled latent (W) dimensionality.
-                 resolution=1024,  # Output resolution.
-                 fmap_base=8192,  # Overall multiplier for the number of feature maps.
-                 fmap_decay=1.0,  # log2 feature map reduction when doubling the resolution.
-                 fmap_max=512,  # Maximum number of feature maps in any layer.
-                 use_wscale=True,  # Enable equalized learning rate?
+                 resolution=1024,   # Output resolution.
+                 fmap_base=8192,    # Overall multiplier for the number of feature maps.
+                 fmap_decay=1.0,    # log2 feature map reduction when doubling the resolution.
+                 fmap_max=512,      # Maximum number of feature maps in any layer.
+                 use_wscale=True,   # Enable equalized learning rate?
                  ):
 
         super().__init__()
@@ -379,26 +393,27 @@ class G_style(nn.Module):
             return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
 
         self.dlatent_size = dlatent_size
-        resolution_log2 = int(np.log2(resolution))
+        resolution_log2   = int(np.log2(resolution))
         assert resolution == 2 ** resolution_log2 and resolution >= 4
-
+        
+        """Create a dictionary, Keys:resolution, Values:StyleMod()"""
         self.style_layers = nn.ModuleDict()
-
         for res in range(2, resolution_log2 + 1):
             channels = nf(res - 1)
-            name = '{s}x{s}'.format(s=2 ** res)
+            name     = '{s}x{s}'.format(s=2 ** res)
             self.style_layers[name + '_0'] = StyleMod(dlatent_size, channels, use_wscale=use_wscale)
             self.style_layers[name + '_1'] = StyleMod(dlatent_size, channels, use_wscale=use_wscale)
 
     def forward(self, w):
         # Input: Disentangled latents (W) [minibatch, num_layers, dlatent_size].
         # lod_in = tf.cast(tf.get_variable('lod', initializer=np.float32(0), trainable=False), dtype)
+        """Get the output of StyleMod in list"""
         styles = []
         for i, m in enumerate(self.style_layers.values()):
                 styles.append(m(w[:, i:i+1]))
         return styles
 
-
+"""ys_to_rgb(ys)會呼叫這裡!"""
 class G_synthesis(nn.Module):
     def __init__(self,
                  dlatent_size=512,  # Disentangled latent (W) dimensionality.
@@ -453,11 +468,19 @@ class G_synthesis(nn.Module):
         
 
     def forward(self, styles):
+        """
+        styles: w經過全連接(LinearTransform)後的結果(w在每一層轉化為不同的風格)
+                A list of `18 array`, each array's shape is [N, 2, channels, 1, 1] 
+        """
         for i, (res, m) in enumerate(self.blocks.items()):
+            #####################################
+            # 每次送進2層style, 首次是InputBlock, 其餘皆是SynthesisBlock
             if i == 0:
                 x = m(styles[2 * i:2 * i + 2])
             else:
                 x = m(x, styles[2 * i:2 * i + 2])
+            #####################################
+            # 最後產出彩色空間的圖
         x = self.torgb(x)
         return x
 
